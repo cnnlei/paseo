@@ -1,4 +1,8 @@
 import { WebSocket } from "ws";
+import { createRequire } from "node:module";
+import { runInNewContext } from "node:vm";
+import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
 import {
   DaemonClient as PublicDaemonClient,
   type WebSocketLike,
@@ -7,6 +11,59 @@ import { expect, test } from "vitest";
 import { createPaseoApi } from "@getpaseo/client";
 import { DaemonClient } from "./test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "./test-utils/paseo-daemon.js";
+
+test.each(["React Native", "native"])(
+  "provider readiness works with %s AbortController",
+  async (runtime) => {
+    const require = createRequire(import.meta.url);
+    const reactNativeRequire = createRequire(require.resolve("react-native/package.json"));
+    const { AbortController: ReactNativeAbortController } = reactNativeRequire(
+      "abort-controller/dist/abort-controller",
+    );
+    const bundle = await build({
+      entryPoints: [fileURLToPath(new URL("../../../client/src/index.ts", import.meta.url))],
+      bundle: true,
+      write: false,
+      format: "iife",
+      globalName: "paseoSdk",
+      platform: "browser",
+    });
+    // A separate runtime starts with React Native's real abort implementation.
+    // Node's globals and the daemon's runtime remain unchanged.
+    const sdk: typeof import("@getpaseo/client") = runInNewContext(
+      `${bundle.outputFiles[0]!.text}\npaseoSdk`,
+      {
+        AbortController: runtime === "React Native" ? ReactNativeAbortController : AbortController,
+        setTimeout,
+        clearTimeout,
+        queueMicrotask,
+        TextEncoder,
+        TextDecoder,
+      },
+    );
+    const daemon = await createTestPaseoDaemon({ mcpEnabled: false });
+    const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+    const api = sdk.createPaseoApi(client);
+    try {
+      await client.connect();
+      const snapshot = await api.providers.waitForReady({ cwd: daemon.staticDir });
+      expect(snapshot.entries.length).toBeGreaterThan(0);
+      expect(snapshot.entries.every((entry) => entry.status !== "loading")).toBe(true);
+      const waiting = api.providers.waitForReady({ cwd: daemon.staticDir });
+      const canceled = expect(waiting).rejects.toThrow(/disposed|released/);
+      await api.dispose();
+      await canceled;
+      const { diagnostic } = await client.collectDiagnostics();
+      expect(diagnostic).toContain("Source registrations: 0");
+      expect(diagnostic).toContain("Producer listeners: 0");
+      expect(() => api.providers.waitForReady()).toThrow("disposed");
+    } finally {
+      await api.dispose();
+      await client.close();
+      await daemon.close();
+    }
+  },
+);
 
 test("two SDK facades own combined agent lists and disposal preserves the other facade", async () => {
   const daemon = await createTestPaseoDaemon({ mcpEnabled: false });
